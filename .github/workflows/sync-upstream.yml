@@ -1,0 +1,105 @@
+# Fork 定制：每天自动同步上游 huilang-me/CF-Server-Monitor 并部署到自己的 Cloudflare
+# 说明：
+# - 上游自带的 deploy.yml / sync.yml / deploy-github-page.yml 已在本 fork 删除（会按作者账号配置误部署）
+# - 部署的 Worker 名固定为 cf-server-monitor（与 2026-10-04 手动部署的一致），D1/API_SECRET 等保持不动
+# - 不要直接往本 fork 的 main 分支推代码，同步时会 reset --hard 到上游
+name: Sync upstream and deploy
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # 每天北京时间 03:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/huilang-me/CF-Server-Monitor.git 2>/dev/null || true
+          git fetch upstream main
+          # 忽略 .github/workflows 目录，对比上游是否有实质代码更新
+          if git diff --quiet upstream/main HEAD -- . ':!.github/workflows'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无实质更新，跳过本次"
+            exit 0
+          fi
+          # reset --hard 到上游会删掉本 fork 独有的 sync-upstream.yml（上游没有这个文件），
+          # 必须先备份、reset 后还原，否则后面的 git add 会报 pathspec 错误 exit 128
+          # （2026-10-20 起连挂 3 次的真因，Run #5 日志实锤）
+          cp .github/workflows/sync-upstream.yml /tmp/sync-upstream.yml.bak
+          git reset --hard upstream/main
+          mkdir -p .github/workflows
+          cp /tmp/sync-upstream.yml.bak .github/workflows/sync-upstream.yml
+          # 重新应用 fork 定制：删除上游自带的 workflow，保留本文件
+          git rm -q --ignore-unmatch .github/workflows/deploy.yml .github/workflows/sync.yml .github/workflows/deploy-github-page.yml
+          git add .github/workflows/sync-upstream.yml
+          git commit -qm "chore: sync upstream $(date -u +%Y-%m-%d)"
+          git push --force origin main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: npm install
+
+      - name: Build frontend
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: npm run build:frontend
+
+      - name: Generate wrangler.toml
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          cat > wrangler.toml << 'WEOF'
+          name = "cf-server-monitor"
+          main = "src/index.js"
+          compatibility_date = "2024-12-01"
+          compatibility_flags = ["nodejs_compat"]
+
+          [triggers]
+          crons = ["*/1 * * * *", "0 * * * *"]
+
+          [assets]
+          directory = "./dist"
+          binding = "ASSETS"
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "server-monitor-db"
+          database_id = "D1_PLACEHOLDER"
+
+          [[durable_objects.bindings]]
+          name = "METRICS_BROADCASTER"
+          class_name = "MetricsBroadcaster"
+
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["MetricsBroadcaster"]
+          WEOF
+          sed -i "s|D1_PLACEHOLDER|${{ secrets.D1_DATABASE_ID }}|g" wrangler.toml
+          echo "wrangler.toml 已生成"
+
+      - name: Deploy to Cloudflare Workers
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: deploy
